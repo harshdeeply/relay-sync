@@ -11,6 +11,8 @@ def now():
 
 
 def parse_time(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be a string")
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         raise ValueError("event timestamp must include timezone")
@@ -24,9 +26,14 @@ def sign(secret, payload):
 class TemporaryFailure(Exception):
     pass
 
+class PermanentFailure(Exception):
+    pass
+
 
 class Relay:
     def __init__(self, path=":memory:", secret="local-demo-secret", max_attempts=3):
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
@@ -47,25 +54,35 @@ class Relay:
             CREATE TABLE IF NOT EXISTS audit (
               id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL,
               action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS inbox_due ON inbox(status,next_attempt,received_at);
         """)
+
+    def close(self):
+        self.db.close()
 
     def audit(self, event_id, action, detail=""):
         self.db.execute("INSERT INTO audit(event_id,action,detail,created_at) VALUES(?,?,?,?)",
                         (event_id, action, detail, now().isoformat()))
 
     def receive(self, raw, signature):
-        if len(raw) > 32768 or not hmac.compare_digest(sign(self.secret, raw), signature):
+        if not isinstance(raw, bytes) or not isinstance(signature, str) or len(raw) > 32768 or not hmac.compare_digest(sign(self.secret, raw), signature):
             raise ValueError("invalid signature or oversized payload")
         event = json.loads(raw)
+        if not isinstance(event, dict):
+            raise ValueError("event must be an object")
         required = ("event_id", "product_id", "version", "name", "price_cents", "updated_at")
         if any(key not in event for key in required):
             raise ValueError("missing event field")
+        if set(event) != set(required):
+            raise ValueError("unexpected event field")
         if not isinstance(event["version"], int) or isinstance(event["version"], bool) or event["version"] < 1:
             raise ValueError("version must be positive integer")
         if not isinstance(event["price_cents"], int) or isinstance(event["price_cents"], bool) or event["price_cents"] < 0:
             raise ValueError("price_cents must be nonnegative integer")
-        if any(not isinstance(event[k], str) or not event[k] or len(event[k]) > 200 for k in ("event_id", "product_id", "name")):
+        if any(not isinstance(event[k], str) or not event[k].strip() or len(event[k]) > 200 for k in ("event_id", "product_id", "name")):
             raise ValueError("invalid event identity or product name")
+        if not isinstance(event["updated_at"], str) or len(event["updated_at"]) > 40:
+            raise ValueError("timestamp too long")
         parse_time(event["updated_at"])
         with self.lock, self.db:
             existing = self.db.execute("SELECT payload FROM inbox WHERE event_id=?", (event["event_id"],)).fetchone()
@@ -88,7 +105,9 @@ class Relay:
                          event["price_cents"], event["updated_at"]))
 
     def process(self, adapter=None, at=None, limit=100):
-        """Process due events. Adapter receives event and may raise TemporaryFailure."""
+        """Process due events. Adapters must deduplicate on event_id after uncertain responses."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
         at = at or now()
         processed = []
         with self.lock:
@@ -97,6 +116,14 @@ class Relay:
             for row in rows:
                 event = json.loads(row["payload"])
                 source = self.db.execute("SELECT version FROM source WHERE product_id=?", (event["product_id"],)).fetchone()
+                if source and source["version"] == event["version"]:
+                    same = self.db.execute("SELECT name,price_cents,updated_at FROM source WHERE product_id=?", (event["product_id"],)).fetchone()
+                    if any(same[k] != event[k] for k in ("name", "price_cents", "updated_at")):
+                        with self.db:
+                            self.db.execute("UPDATE inbox SET status='dead',last_error='conflicting product version' WHERE event_id=?", (row["event_id"],))
+                            self.audit(row["event_id"], "dead", "conflicting product version")
+                        processed.append((row["event_id"], "dead"))
+                        continue
                 if source and source["version"] >= event["version"]:
                     with self.db:
                         self.db.execute("UPDATE inbox SET status='stale' WHERE event_id=?", (row["event_id"],))
@@ -106,9 +133,9 @@ class Relay:
                 try:
                     if adapter:
                         adapter(event)
-                except TemporaryFailure as exc:
+                except (TemporaryFailure, PermanentFailure) as exc:
                     attempts = row["attempts"] + 1
-                    status = "dead" if attempts >= self.max_attempts else "pending"
+                    status = "dead" if isinstance(exc, PermanentFailure) or attempts >= self.max_attempts else "pending"
                     next_attempt = at + timedelta(seconds=min(60, 2 ** attempts))
                     with self.db:
                         self.db.execute("UPDATE inbox SET attempts=?,status=?,next_attempt=?,last_error=? WHERE event_id=?",
@@ -149,5 +176,16 @@ class Relay:
             return drift
 
     def snapshot(self):
-        return {table: [dict(row) for row in self.db.execute(f"SELECT * FROM {table} ORDER BY 1")]
-                for table in ("source", "target", "inbox", "audit")}
+        with self.lock:
+            return {table: [dict(row) for row in self.db.execute(f"SELECT * FROM {table} ORDER BY 1")]
+                    for table in ("source", "target", "inbox", "audit")}
+
+    def metrics(self):
+        with self.lock:
+            statuses = {row["status"]: row["count"] for row in self.db.execute(
+                "SELECT status,COUNT(*) AS count FROM inbox GROUP BY status")}
+            oldest = self.db.execute("SELECT MIN(received_at) FROM inbox WHERE status='pending'").fetchone()[0]
+            return {"events": statuses, "oldest_pending_at": oldest,
+                    "source_products": self.db.execute("SELECT COUNT(*) FROM source").fetchone()[0],
+                    "target_products": self.db.execute("SELECT COUNT(*) FROM target").fetchone()[0],
+                    "drifted_products": len(self.reconcile())}
