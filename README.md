@@ -4,6 +4,16 @@
 
 This is original reference code with fictional products. The optional HTTPS adapter speaks a generic contract; there is no Shopify, Inriver, or customer connection.
 
+## Live interactive replay
+
+**[Open the monochrome Relay Sync demo](https://relay-sync-demo.netlify.app/)**. It works on desktop and mobile without a login.
+
+1. Select **Generate event**, then **Process next** to deliver a catalog update.
+2. Select **Simulate drift**, then **Repair drift** to see a source/target mismatch resolved.
+3. Select **Reset demo**. Select **Simulate outage**, **Generate event**, and **Process next** three times to move the event into the dead-letter queue. Select **Replay dead letter**, then **Process next** to recover it.
+
+This hosted page is a **browser-local replay with synthetic data**. It saves state in localStorage. It does not call the Python/SQLite backend or an external partner. The runnable backend, HTTP adapter, signed webhook, and operator dashboard are in this repository; use the commands below to inspect those paths. The replay's state machine is in [`web/simulator.mjs`](web/simulator.mjs) and has its own tests.
+
 ## Try the complete incident
 
 Python 3.12+ and the standard library are sufficient.
@@ -12,6 +22,8 @@ Python 3.12+ and the standard library are sufficient.
 python3 -m unittest discover -s tests -v
 python3 -m relay.demo
 ```
+
+For the browser replay tests, run `node --test web/simulator.test.mjs` (Node.js 22+). The static page can be served locally with `python3 -m http.server 8080 -d web` and opened at **http://127.0.0.1:8080**.
 
 The narrated demo sends version 2 before version 1, replays a duplicate, corrupts the target price, repairs the drift, fails partner delivery three times, and replays the dead-lettered event. It prints the audit trail and final target state.
 
